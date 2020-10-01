@@ -1,0 +1,828 @@
+---
+title: "Data Cleaning and Analysis"
+author: "Miles D. Williams"
+date: "December 11, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+In this file, I load and clean raw AidData data on Chinese financial flows to create a data file for analysis. I merge this with data from the Cline Center's Archer portal on Xinhwua coverage of developing countries. With the addition of control variables pulled from open sources available through R, I then conduct my analysis.
+
+```{r libraries}
+try(library(tidyverse))
+try(library(tidytext))
+library(kableExtra)
+library(foreach)
+```
+
+```{r}
+# Get aid data
+read_csv("china_aid_data.csv") %>% 
+  filter(recommended_for_research == T) %>%
+  rename(country= recipient_condensed) %>%
+  group_by(country, year) %>%
+  summarize(aid = sum(usd_defl_2014)) -> china_aid
+china_aid$aid[is.na(china_aid$aid)] = 0
+
+# Controls
+pwt9::pwt9.1 -> penn
+penn %>%
+  select(country, year, rgdpna, pop, emp) %>%
+  group_by(country) %>%
+  mutate(rgdpna = lag(rgdpna/pop, order_by = year),
+         pop = lag(pop, order_by = year),
+         emp = lag(emp/pop, order_by = year)) %>%
+  ungroup() %>%
+  right_join(china_aid) -> china_aid
+
+#library(devtools)
+#install_github("ropengov/rqog")
+library(rqog)
+read_qog(which_data="basic", data_type = "time-series") -> basic_qog
+basic_qog %>%
+  rename(country = cname) %>%
+  select(country, year, icrg_qog, vdem_polyarchy) %>%
+  group_by(country) %>%
+  mutate(icrg_qog = lag(icrg_qog, order_by = year), 
+         vdem_polyarchy = lag(vdem_polyarchy, order_by = year)) %>%
+  ungroup() %>%
+  right_join(china_aid) -> china_aid
+
+read_csv("cow_trade_data.csv") %>%
+  filter(importer1 == "China") %>%
+  rename(country = importer2, trade = smoothtotrade) %>%
+  select(year, country, trade) %>%
+  group_by(country) %>%
+  mutate(trade = lag(log(trade + 1), order_by = year)) %>%
+  right_join(china_aid) -> china_aid
+china_aid$trade[is.na(china_aid$trade)] = 0
+```
+
+
+```{r}
+# Get Xinhua data
+read_tsv("12_14_2019 19_21_06.tsv") %>%
+  filter(publisher == "Xinhua General News Service") -> xinhua
+
+# Make year variable
+xinhua %>%
+  mutate(
+    year = format(as.Date(publication_date,"%m/%d/%Y"),"%Y") %>%
+      stringr::str_replace(.,"00","20") %>%
+      as.numeric()
+  ) -> xinhua
+```
+
+
+```{r}
+foreach(
+  i = unique(china_aid$country),  
+  .combine = 'rbind'
+) %do% {
+  foreach(j = unique(china_aid$year), 
+          .combine = 'rbind') %do% {
+  xinhua %>%
+    filter(year == j) %>%
+    unnest_tokens(country_names, country) %>%
+    .$country_names -> patterns
+  china_aid %>%
+    filter(country == i, year == j) -> country_year
+  str_detect(
+      tolower(country_year$country),
+      pattern = unique(patterns)
+    ) %>%
+    sum(., na.rm=T) -> counts
+  tibble(
+    country = i,
+    year = j,
+    counts = counts
+  )
+        }
+} -> count_data
+count_data$counts[is.na(count_data$counts)] = 0
+```
+
+```{r}
+china_aid %>%
+  left_join(count_data, by = c("year","country")) %>%
+  group_by(year) %>%
+  mutate(aid_rank = log(aid + 1)) -> analysis_data
+ggplot(data = analysis_data) +
+  aes(aid_rank, as.numeric(counts>0)) +
+  geom_jitter(width = .05, height = .05, alpha = .5) +
+  geom_smooth(method = "lm")
+```
+
+
+# Analysis
+
+```{r}
+# Correlations among sentiments
+xinhua %>%
+  mutate(
+    bl_sent = bing_liu_pos - bing_liu_neg,
+    gi_sent = inquirer_pos - inquirer_neg,
+    lx_sent = lexicoder_pos - lexicoder_neg
+  ) %>%
+  select(contains("sent")) %>%
+  cor(.) %>%
+  round(., 2) %>%
+  kable(col.names = c("Bing Liu","Inquirer","Lexicoder"),
+        label = c("Bing Liu","Inquirer","Lexicoder"),
+        "latex")
+```
+
+
+```{r}
+library(lmtest)
+library(sandwich)
+lm(aid_rank~ I(counts>0) + as.factor(year), analysis_data) -> model1
+lm(counts>0 ~ aid_rank + as.factor(year), analysis_data) -> model2
+
+model1 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "I(counts > 0)TRUE") %>%
+  mutate(term = "Coverage") %>%
+  dotwhisker::dwplot(dot_args = list(color = "black")) +
+  geom_vline(xintercept = 0) +
+  labs(
+    x = "Estimated Increase in (ln)"
+  ) +
+  theme(
+    axis.title.x = element_text(face = "italic")
+  ) -> p1
+model2 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "aid_rank") %>%
+  mutate(term = "Aid (ln)") %>%
+  dotwhisker::dwplot(dot_args = list(color = "black")) +
+  geom_vline(xintercept = 0) +
+  labs(
+    x = "Estimated Increase in Pr(Coverage)"
+  ) +
+  theme(
+    axis.title.x = element_text(face = "italic")
+  ) -> p2
+gridExtra::grid.arrange(p1, p2, ncol = 2, 
+                        top = grid::textGrob(
+                          "Contemporaneous coverage and aid allocation",
+                          gp = grid::gpar(fontface = 4, fontsize = 14),
+                          hjust = .5
+                        )) -> plot_1
+ggsave(plot_1, filename = "plot_1.png", 
+       units = "in", height = 3, width = 8)
+```
+
+```{r}
+analysis_data %>%
+  group_by(country) %>%
+  mutate(count_lag = lag(counts, order_by = year),
+         aid_rank_lag = lag(aid_rank, order_by = year)) %>%
+  ungroup() -> analysis_data
+
+lm(aid_rank ~ I(count_lag>0), analysis_data) -> model3
+lm(counts>0 ~ aid_rank_lag, analysis_data) -> model4
+
+lm(aid_rank ~ I(count_lag>0) + as.factor(year), analysis_data) -> model5
+lm(counts>0 ~ aid_rank_lag + as.factor(year), analysis_data) -> model6
+
+lm(aid_rank ~ I(count_lag>0) + log(emp) + log(pop) + log(rgdpna) + vdem_polyarchy + trade, analysis_data) -> model7
+lm(counts>0 ~ aid_rank_lag + log(emp) + log(pop) + log(rgdpna) + vdem_polyarchy + trade, analysis_data) -> model8
+
+lm(aid_rank ~ I(count_lag>0) + log(emp) + log(pop) + log(rgdpna) + vdem_polyarchy + trade + 
+     as.factor(year), analysis_data) -> model9
+lm(counts>0 ~ aid_rank_lag + log(emp) + log(pop) + log(rgdpna) + vdem_polyarchy + trade + 
+     as.factor(year), analysis_data) -> model10
+
+rbind(model3 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "I(count_lag > 0)TRUE") %>%
+  mutate(term = "Coverage\n(prior year)", model = "FE: no; Controls: no"),
+  model5 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "I(count_lag > 0)TRUE") %>%
+  mutate(term = "Coverage\n(prior year)", model = "FE: yes; Controls: no"),
+  model7 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "I(count_lag > 0)TRUE") %>%
+  mutate(term = "Coverage\n(prior year)", model = "FE: no; Controls: yes"),
+  model9 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "I(count_lag > 0)TRUE") %>%
+  mutate(term = "Coverage\n(prior year)", model = "FE: yes; Controls: yes")) %>%
+  dotwhisker::dwplot() +
+  geom_vline(xintercept = 0) +
+  labs(
+    x = "Estimated Difference in Aid (ln)"
+  ) +
+  theme(
+    axis.title.x = element_text(face = "italic"),
+    legend.position = c(.25,.175),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 5)
+  ) -> p3
+rbind(model4 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "aid_rank_lag") %>%
+  mutate(term = "Aid (ln)\n(prior year)", model = "FE: no; Controls: no"),
+  model6 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "aid_rank_lag") %>%
+  mutate(term = "Aid (ln)\n(prior year)", model = "FE: yes; Controls: no"),
+  model8 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "aid_rank_lag") %>%
+  mutate(term = "Aid (ln)\n(prior year)", model = "FE: no; Controls: yes"),
+  model10 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "aid_rank_lag") %>%
+  mutate(term = "Aid (ln)\n(prior year)", model = "FE: yes; Controls: yes")) %>%
+  dotwhisker::dwplot() +
+  geom_vline(xintercept = 0) +
+  labs(
+    x = "Estimated Difference in Pr(Coverage)"
+  ) +
+  theme(
+    axis.title.x = element_text(face = "italic"),
+    legend.position = "none"
+  ) -> p4
+gridExtra::grid.arrange(p3, p4, ncol = 2, 
+                        top = grid::textGrob(
+                          "Estimates for Aid Recipient Coverage",
+                          gp = grid::gpar(fontface = 4, fontsize = 14),
+                          hjust = .5
+                        )) -> plot_2
+ggsave(plot_2, filename = "plot_2.png",
+       units = "in", height = 4, width = 8)
+```
+
+
+```{r}
+library(stargazer)
+```
+
+```{r}
+list(
+    sqrt(diag(vcovHC(model3, "HC1"))),
+    sqrt(diag(vcovHC(model4, "HC1"))),
+    sqrt(diag(vcovHC(model5, "HC1"))),
+    sqrt(diag(vcovHC(model6, "HC1"))),
+    sqrt(diag(vcovHC(model7, "HC1"))),
+    sqrt(diag(vcovHC(model8, "HC1"))),
+    sqrt(diag(vcovHC(model9, "HC1"))),
+    sqrt(diag(vcovHC(model10, "HC1")))
+  ) -> ses
+```
+
+```{r}
+stargazer(
+  header = F,
+  title = "OLS Coefficients for Chinese Aid and Xinhua Coverage of Recipients",
+  model3, model4, model5, model6, model7, model8, model9, model10,
+  se = ses,
+  dep.var.caption = "Outcome Variable",
+  dep.var.labels = rep(c("Aid (ln)", "Coverage"), len = 8),
+  column.sep.width = "0pt",
+  omit = "year",
+  covariate.labels = c(
+    "Coverage",
+    "Aid (ln)",
+    "Employment Rate (ln)",
+    "Population (ln)",
+    "Income (ln)",
+    "Democracy",
+    "Trade (ln)"
+  ),
+  add.lines = list(
+    c("Year FE?", "No", "No", "Yes", "Yes", "No", "No", "Yes", "Yes")
+  ),
+  float.env = "sidewaystable",
+  keep.stat = c("n","adj.rsq"),
+  out = "reg_table1.tex"
+) 
+```
+
+```{r}
+xinhua %>%
+  unnest_tokens(country_name, country) %>%
+  group_by(country_name, year) %>%
+  summarize_if(is.numeric, mean) %>%
+  mutate(
+    bl_sent = bing_liu_pos - bing_liu_neg,
+    gi_sent = inquirer_pos - inquirer_neg,
+    lx_sent = lexicoder_pos - lexicoder_neg
+  ) %>%
+  select(country_name, year, bl_sent, gi_sent, lx_sent) %>%
+  rename(country = country_name) -> morality
+analysis_data %>%
+  mutate(country = tolower(country)) %>%
+  left_join(morality, by = c("country","year")) -> analysis_data
+```
+
+
+```{r}
+lm(aid_rank ~ bl_sent + as.factor(year), analysis_data) -> model1
+lm(bl_sent ~ aid_rank + as.factor(year), analysis_data) -> model2
+
+model1 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "bl_sent") %>%
+  mutate(term = "Sentiment") %>%
+  dotwhisker::dwplot(dot_args = list(color = "black")) +
+  geom_vline(xintercept = 0) +
+  labs(
+    x = "Estimated Increase in (ln)"
+  ) +
+  theme(
+    axis.title.x = element_text(face = "italic")
+  ) -> p1
+model2 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "aid_rank") %>%
+  mutate(term = "(ln)") %>%
+  dotwhisker::dwplot(dot_args = list(color = "black")) +
+  geom_vline(xintercept = 0) +
+  labs(
+    x = "Estimated Increase in Virtuous Sentiment"
+  ) +
+  theme(
+    axis.title.x = element_text(face = "italic")
+  ) -> p2
+gridExtra::grid.arrange(p1, p2, ncol = 2, 
+                        top = grid::textGrob(
+                          "Contemporaneous sentiment of coverage and aid allocation",
+                          gp = grid::gpar(fontface = 4, fontsize = 14),
+                          hjust = .5
+                        )) -> plot_3
+ggsave(plot_3, filename = "plot_3.png", 
+       units = "in", height = 3, width = 8)
+```
+
+```{r}
+analysis_data$bl_sent[is.na(analysis_data$bl_sent)] = 0
+analysis_data$gi_sent[is.na(analysis_data$gi_sent)] = 0
+analysis_data$lx_sent[is.na(analysis_data$lx_sent)] = 0
+stand = function(x) (x - mean(x, na.rm = T))/sd(x, na.rm = T)
+analysis_data %>%
+  group_by(country) %>%
+  mutate(bl_sent_lag = lag(bl_sent, order_by = year),
+         gi_sent_lag = lag(gi_sent, order_by = year),
+         lx_sent_lag = lag(lx_sent, order_by = year)) %>%
+  ungroup() %>%
+  group_by(year) %>%
+  mutate(bl_sent_lag = stand(bl_sent_lag),
+         gi_sent_lag = stand(gi_sent_lag),
+         lx_sent_lag = stand(lx_sent_lag)) -> analysis_data2
+
+lm(aid_rank ~ bl_sent_lag, analysis_data2) -> model3
+lm(bl_sent ~ aid_rank_lag, analysis_data2) -> model4
+
+lm(aid_rank ~ bl_sent_lag + as.factor(year), analysis_data2) -> model5
+lm(bl_sent ~ aid_rank_lag + as.factor(year), analysis_data2) -> model6
+
+lm(aid_rank ~ bl_sent_lag + log(emp) + log(pop) + log(rgdpna) + vdem_polyarchy + trade, analysis_data2) -> model7
+lm(bl_sent ~ aid_rank_lag + log(emp) + log(pop) + log(rgdpna) + 
+     vdem_polyarchy + trade, analysis_data2) -> model8
+
+lm(aid_rank ~ bl_sent_lag + log(emp) + log(pop) + log(rgdpna) + vdem_polyarchy + trade + 
+     as.factor(year), analysis_data2) -> model9
+lm(bl_sent ~ aid_rank_lag + log(emp) + log(pop) + log(rgdpna) + vdem_polyarchy + trade + 
+     as.factor(year), analysis_data2) -> model10
+
+rbind(model3 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "bl_sent_lag") %>%
+  mutate(term = "Sentiment\n(prior year)", model = "FE: no; Controls: no"),
+  model5 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "bl_sent_lag") %>%
+  mutate(term = "Sentiment\n(prior year)", model = "FE: yes; Controls: no"),
+  model7 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "bl_sent_lag") %>%
+  mutate(term = "Sentiment\n(prior year)", model = "FE: no; Controls: yes"),
+  model9 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "bl_sent_lag") %>%
+  mutate(term = "Sentiment\n(prior year)", model = "FE: yes; Controls: yes")) %>%
+  dotwhisker::dwplot() +
+  geom_vline(xintercept = 0) +
+  labs(
+    x = "Estimated Difference in Aid (ln)"
+  ) +
+  theme(
+    axis.title.x = element_text(face = "italic"),
+    legend.position = c(.25,.175),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 5)
+  ) -> p3
+rbind(model4 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "aid_rank_lag") %>%
+  mutate(term = "Aid (ln)\n(prior year)", model = "FE: no; Controls: no"),
+  model6 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "aid_rank_lag") %>%
+  mutate(term = "Aid (ln)\n(prior year)", model = "FE: yes; Controls: no"),
+  model8 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "aid_rank_lag") %>%
+  mutate(term = "Aid (ln)\n(prior year)", model = "FE: no; Controls: yes"),
+  model10 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "aid_rank_lag") %>%
+  mutate(term = "Aid (ln)\n(prior year)", model = "FE: yes; Controls: yes")) %>%
+  dotwhisker::dwplot() +
+  geom_vline(xintercept = 0) +
+  labs(
+    x = "Estimated Difference in Net Sentiment"
+  ) +
+  theme(
+    axis.title.x = element_text(face = "italic"),
+    legend.position = "none"
+  ) -> p4
+gridExtra::grid.arrange(p3, p4, ncol = 2, 
+                        top = grid::textGrob(
+                          "Estimates with Bing Liu Sentiment",
+                          gp = grid::gpar(fontface = 4, fontsize = 14),
+                          hjust = .5
+                        )) -> plot_4
+ggsave(plot_4, filename = "plot_4.png",
+       units = "in", height = 4, width = 8)
+```
+
+```{r}
+list(
+    sqrt(diag(vcovHC(model3, "HC1"))),
+    sqrt(diag(vcovHC(model4, "HC1"))),
+    sqrt(diag(vcovHC(model5, "HC1"))),
+    sqrt(diag(vcovHC(model6, "HC1"))),
+    sqrt(diag(vcovHC(model7, "HC1"))),
+    sqrt(diag(vcovHC(model8, "HC1"))),
+    sqrt(diag(vcovHC(model9, "HC1"))),
+    sqrt(diag(vcovHC(model10, "HC1")))
+  ) -> ses
+```
+
+```{r}
+stargazer(
+  header = F,
+  title = "OLS Coefficients for Chinese Aid and Bing Liu Sentiment Analysis of Xinhua Coverage of Recipients",
+  model3, model4, model5, model6, model7, model8, model9, model10,
+  se = ses,
+  dep.var.caption = "Outcome Variable",
+  dep.var.labels = rep(c("Aid (ln)", "Sentiment"), len = 8),
+  column.sep.width = "0pt",
+  omit = "year",
+  covariate.labels = c(
+    "Sentiment",
+    "Aid (ln)",
+    "Employment Rate (ln)",
+    "Population (ln)",
+    "Income (ln)",
+    "Democracy",
+    "Trade (ln)"
+  ),
+  add.lines = list(
+    c("Year FE?", "No", "No", "Yes", "Yes", "No", "No", "Yes", "Yes")
+  ),
+  float.env = "sidewaystable",
+  keep.stat = c("n","adj.rsq"),
+  out = "reg_table2.tex"
+) 
+```
+
+
+```{r}
+lm(aid_rank ~ gi_sent_lag, analysis_data2) -> model3
+lm(gi_sent ~ aid_rank_lag, analysis_data2) -> model4
+
+lm(aid_rank ~ gi_sent_lag + as.factor(year), analysis_data2) -> model5
+lm(gi_sent ~ aid_rank_lag + as.factor(year), analysis_data2) -> model6
+
+lm(aid_rank ~ gi_sent_lag + log(emp) + log(pop) + log(rgdpna) + vdem_polyarchy + trade, analysis_data2) -> model7
+lm(gi_sent ~ aid_rank_lag + log(emp) + log(pop) + log(rgdpna) + 
+     vdem_polyarchy + trade, analysis_data2) -> model8
+
+lm(aid_rank ~ gi_sent_lag + log(emp) + log(pop) + log(rgdpna) + vdem_polyarchy + trade + 
+     as.factor(year), analysis_data2) -> model9
+lm(gi_sent ~ aid_rank_lag + log(emp) + log(pop) + log(rgdpna) + vdem_polyarchy + trade + 
+     as.factor(year), analysis_data2) -> model10
+
+rbind(model3 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "gi_sent_lag") %>%
+  mutate(term = "Sentiment\n(prior year)", model = "FE: no; Controls: no"),
+  model5 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "gi_sent_lag") %>%
+  mutate(term = "Sentiment\n(prior year)", model = "FE: yes; Controls: no"),
+  model7 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "gi_sent_lag") %>%
+  mutate(term = "Sentiment\n(prior year)", model = "FE: no; Controls: yes"),
+  model9 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "gi_sent_lag") %>%
+  mutate(term = "Sentiment\n(prior year)", model = "FE: yes; Controls: yes")) %>%
+  dotwhisker::dwplot() +
+  geom_vline(xintercept = 0) +
+  labs(
+    x = "Estimated Difference in Aid (ln)"
+  ) +
+  theme(
+    axis.title.x = element_text(face = "italic"),
+    legend.position = c(.25,.175),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 5)
+  ) -> p5
+rbind(model4 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "aid_rank_lag") %>%
+  mutate(term = "Aid (ln)\n(prior year)", model = "FE: no; Controls: no"),
+  model6 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "aid_rank_lag") %>%
+  mutate(term = "Aid (ln)\n(prior year)", model = "FE: yes; Controls: no"),
+  model8 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "aid_rank_lag") %>%
+  mutate(term = "Aid (ln)\n(prior year)", model = "FE: no; Controls: yes"),
+  model10 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "aid_rank_lag") %>%
+  mutate(term = "Aid (ln)\n(prior year)", model = "FE: yes; Controls: yes")) %>%
+  dotwhisker::dwplot() +
+  geom_vline(xintercept = 0) +
+  labs(
+    x = "Estimated Difference in Net Sentiment"
+  ) +
+  theme(
+    axis.title.x = element_text(face = "italic"),
+    legend.position = "none"
+  ) -> p6
+gridExtra::grid.arrange(p5, p6, ncol = 2, 
+                        top = grid::textGrob(
+                          "Estimates with General Inquirer Sentiment",
+                          gp = grid::gpar(fontface = 4, fontsize = 14),
+                          hjust = .5
+                        )) -> plot_5
+ggsave(plot_5, filename = "plot_5.png",
+       units = "in", height = 4, width = 8)
+```
+
+```{r}
+list(
+    sqrt(diag(vcovHC(model3, "HC1"))),
+    sqrt(diag(vcovHC(model4, "HC1"))),
+    sqrt(diag(vcovHC(model5, "HC1"))),
+    sqrt(diag(vcovHC(model6, "HC1"))),
+    sqrt(diag(vcovHC(model7, "HC1"))),
+    sqrt(diag(vcovHC(model8, "HC1"))),
+    sqrt(diag(vcovHC(model9, "HC1"))),
+    sqrt(diag(vcovHC(model10, "HC1")))
+  ) -> ses
+```
+
+```{r}
+stargazer(
+  header = F,
+  title = "OLS Coefficients for Chinese Aid and General Inquirer Sentiment Analysis of Xinhua Coverage of Recipients",
+  model3, model4, model5, model6, model7, model8, model9, model10,
+  se = ses,
+  dep.var.caption = "Outcome Variable",
+  dep.var.labels = rep(c("Aid (ln)", "Sentiment"), len = 8),
+  column.sep.width = "0pt",
+  omit = "year",
+  covariate.labels = c(
+    "Sentiment",
+    "Aid (ln)",
+    "Employment Rate (ln)",
+    "Population (ln)",
+    "Income (ln)",
+    "Democracy",
+    "Trade (ln)"
+  ),
+  add.lines = list(
+    c("Year FE?", "No", "No", "Yes", "Yes", "No", "No", "Yes", "Yes")
+  ),
+  float.env = "sidewaystable",
+  keep.stat = c("n","adj.rsq"),
+  out = "reg_table3.tex"
+) 
+```
+
+
+```{r}
+lm(aid_rank ~ lx_sent_lag, analysis_data2) -> model3
+lm(lx_sent ~ aid_rank_lag, analysis_data2) -> model4
+
+lm(aid_rank ~ lx_sent_lag + as.factor(year), analysis_data2) -> model5
+lm(lx_sent ~ aid_rank_lag + as.factor(year), analysis_data2) -> model6
+
+lm(aid_rank ~ lx_sent_lag + log(emp) + log(pop) + log(rgdpna) + vdem_polyarchy + trade, analysis_data2) -> model7
+lm(lx_sent ~ aid_rank_lag + log(emp) + log(pop) + log(rgdpna) + 
+     vdem_polyarchy + trade, analysis_data2) -> model8
+
+lm(aid_rank ~ lx_sent_lag + log(emp) + log(pop) + log(rgdpna) + vdem_polyarchy + trade + 
+     as.factor(year), analysis_data2) -> model9
+lm(lx_sent ~ aid_rank_lag + log(emp) + log(pop) + log(rgdpna) + vdem_polyarchy + trade + 
+     as.factor(year), analysis_data2) -> model10
+
+rbind(model3 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "lx_sent_lag") %>%
+  mutate(term = "Sentiment\n(prior year)", model = "FE: no; Controls: no"),
+  model5 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "lx_sent_lag") %>%
+  mutate(term = "Sentiment\n(prior year)", model = "FE: yes; Controls: no"),
+  model7 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "lx_sent_lag") %>%
+  mutate(term = "Sentiment\n(prior year)", model = "FE: no; Controls: yes"),
+  model9 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "lx_sent_lag") %>%
+  mutate(term = "Sentiment\n(prior year)", model = "FE: yes; Controls: yes")) %>%
+  dotwhisker::dwplot() +
+  geom_vline(xintercept = 0) +
+  labs(
+    x = "Estimated Difference in Aid (ln)"
+  ) +
+  theme(
+    axis.title.x = element_text(face = "italic"),
+    legend.position = c(.25,.175),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 5)
+  ) -> p7
+rbind(model4 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "aid_rank_lag") %>%
+  mutate(term = "Aid (ln)\n(prior year)", model = "FE: no; Controls: no"),
+  model6 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "aid_rank_lag") %>%
+  mutate(term = "Aid (ln)\n(prior year)", model = "FE: yes; Controls: no"),
+  model8 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "aid_rank_lag") %>%
+  mutate(term = "Aid (ln)\n(prior year)", model = "FE: no; Controls: yes"),
+  model10 %>%
+  coeftest(., vcov = vcovHC(., "HC1")) %>%
+  broom::tidy(.) %>%
+  filter(term == "aid_rank_lag") %>%
+  mutate(term = "Aid (ln)\n(prior year)", model = "FE: yes; Controls: yes")) %>%
+  dotwhisker::dwplot() +
+  geom_vline(xintercept = 0) +
+  labs(
+    x = "Estimated Difference in Net Sentiment"
+  ) +
+  theme(
+    axis.title.x = element_text(face = "italic"),
+    legend.position = "none"
+  ) -> p8
+gridExtra::grid.arrange(p7, p8, ncol = 2, 
+                        top = grid::textGrob(
+                          "Estimates with Lexicoder Sentiment",
+                          gp = grid::gpar(fontface = 4, fontsize = 14),
+                          hjust = .5
+                        )) -> plot_6
+ggsave(plot_6, filename = "plot_6.png",
+       units = "in", height = 4, width = 8)
+```
+
+```{r}
+list(
+    sqrt(diag(vcovHC(model3, "HC1"))),
+    sqrt(diag(vcovHC(model4, "HC1"))),
+    sqrt(diag(vcovHC(model5, "HC1"))),
+    sqrt(diag(vcovHC(model6, "HC1"))),
+    sqrt(diag(vcovHC(model7, "HC1"))),
+    sqrt(diag(vcovHC(model8, "HC1"))),
+    sqrt(diag(vcovHC(model9, "HC1"))),
+    sqrt(diag(vcovHC(model10, "HC1")))
+  ) -> ses
+```
+
+```{r}
+stargazer(
+  header = F,
+  title = "OLS Coefficients for Chinese Aid and Lexicoder Sentiment Analysis of Xinhua Coverage of Recipients",
+  model3, model4, model5, model6, model7, model8, model9, model10,
+  se = ses,
+  dep.var.caption = "Outcome Variable",
+  dep.var.labels = rep(c("Aid (ln)", "Sentiment"), len = 8),
+  column.sep.width = "0pt",
+  omit = "year",
+  covariate.labels = c(
+    "Sentiment",
+    "Aid (ln)",
+    "Employment Rate (ln)",
+    "Population (ln)",
+    "Income (ln)",
+    "Democracy",
+    "Trade (ln)"
+  ),
+  add.lines = list(
+    c("Year FE?", "No", "No", "Yes", "Yes", "No", "No", "Yes", "Yes")
+  ),
+  float.env = "sidewaystable",
+  keep.stat = c("n","adj.rsq"),
+  out = "reg_table4.tex"
+) 
+```
+
+
+```{r}
+# Compare model performance
+lm(bl_sent ~ aid_rank_lag + log(emp) + log(pop) + log(rgdpna) + vdem_polyarchy + trade, analysis_data2) -> m1
+lm(gi_sent ~ aid_rank_lag + log(emp) + log(pop) + log(rgdpna) + vdem_polyarchy + trade, analysis_data2) -> m2
+lm(lx_sent ~ aid_rank_lag + log(emp) + log(pop) + log(rgdpna) + vdem_polyarchy + trade, analysis_data2) -> m3
+lrtest(m3, m1, m2) %>%
+  kable("latex") 
+```
+
+Summary statistics.
+
+```{r}
+analysis_data2 %>%
+  ungroup() %>%
+    select(trade, rgdpna, pop, emp, vdem_polyarchy,
+           aid_rank, counts, bl_sent, gi_sent, lx_sent) %>%
+  mutate(rgdpna = log(rgdpna), 
+         pop = log(pop),
+         emp = log(emp)) %>%
+  summarise_all(
+    list(
+      n = function(x) length(x[!is.na(x)]),
+      mean = function(x) mean(x, na.rm = T),
+      sd = function(x) sd(x, na.rm = T)
+    )
+  ) %>%
+  gather %>%
+  mutate(stat = str_extract(key, '[^_]+$'),
+         key = str_extract(key, '.+(?=\\_)')) %>%
+  spread(key = stat, value = value) %>%
+  mutate_if(is.numeric, function(x) round(x, 2)) %>%
+  rename(
+    Variable = key,
+    Mean = mean,
+    N = n,
+    SD = sd
+  ) %>%
+  mutate(
+    Variable = c(
+      "Aid (ln)",
+      "Bing Liu",
+      "Coverage",
+      "Employment (ln)",
+      "General Inquirer",
+      "Lexicoder",
+      "Population (ln)",
+      "Income (ln)",
+      "Trade (ln)",
+      "Democracy"
+    )
+  ) %>%
+  kable("latex", caption = "Summary Statistics")
+```
+
