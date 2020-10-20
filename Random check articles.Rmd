@@ -1,0 +1,35 @@
+---
+title: "Random check articles"
+author: "Lucie Lu"
+date: "10/19/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r librarie}
+library(tidyverse)
+```
+
+```{r access files}
+mydata <- read_tsv("https://raw.githubusercontent.com/milesdwilliams15/chinese_foreign_aid_and_media/main/12_14_2019%2019_21_06.tsv")
+
+head(mydata)
+```
+
+```{r random draw 100 articles}
+
+set.seed(212309)
+sub_data <- mydata[sample(1:nrow(mydata), 100, replace=F),]
+sub_data$check <- 9
+structure(sub_data)
+```
+
+```{r next steps}
+
+#Miles: do you mind working on the first 50? Check if the article is what we need, if so, change it to 1.
+
+
+```
