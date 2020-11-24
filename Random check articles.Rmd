@@ -30,6 +30,28 @@ structure(sub_data)
 ```{r next steps}
 
 #Miles: do you mind working on the first 50? Check if the article is what we need, if so, change it to 1.
+#Lucie: 51-100
+sub_data$aid <- as.character(sub_data$aid)
+structure(sub_data)
+
+sub_data_LL <- sub_data[51:100,]
+sub_data_LL$check <-
+c(0, 0, 0, 0, 0, 
+  0, 0, 0, 0, 0,
+  
+  0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0,
+  
+  0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0,
+  
+  0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0,
+  
+  0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0)
 
 
+#3 articles from Xinhua
+#None of the 50 articles really talk about aids from China or their impacts on the aid recipient countries.
 ```
